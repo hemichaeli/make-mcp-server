@@ -1,7 +1,7 @@
-import express from "express";
+import express, { Request, Response } from "express";
+import { randomUUID } from "crypto";
 
 const app = express();
-app.use(express.json());
 
 // Configuration from environment
 const MAKE_API_TOKEN = process.env.MAKE_API_TOKEN || "";
@@ -10,6 +10,9 @@ const MAKE_TEAM_ID = process.env.MAKE_TEAM_ID || "";
 const PORT = process.env.PORT || 3000;
 
 const BASE_URL = `https://${MAKE_ZONE}/api/v2`;
+
+// Session management for SSE
+const sessions = new Map<string, Response>();
 
 // Helper function for API requests
 async function makeRequest(
@@ -199,32 +202,9 @@ async function executeTool(name: string, args: any): Promise<any> {
   }
 }
 
-// SSE endpoint for MCP
-app.get("/sse", (req, res) => {
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  
-  const initEvent = {
-    jsonrpc: "2.0",
-    method: "initialized",
-    params: {
-      protocolVersion: "2024-11-05",
-      serverInfo: { name: "make-mcp-server", version: "1.0.0" },
-      capabilities: { tools: {} },
-    },
-  };
-  
-  res.write(`data: ${JSON.stringify(initEvent)}\n\n`);
-  
-  const keepAlive = setInterval(() => res.write(": keepalive\n\n"), 30000);
-  req.on("close", () => clearInterval(keepAlive));
-});
-
-// MCP message endpoint
-app.post("/mcp", async (req, res) => {
-  const { jsonrpc, id, method, params } = req.body;
+// Handle MCP JSON-RPC request
+async function handleMcpRequest(request: any): Promise<any> {
+  const { jsonrpc, id, method, params } = request;
   
   try {
     let result;
@@ -233,10 +213,13 @@ app.post("/mcp", async (req, res) => {
       case "initialize":
         result = {
           protocolVersion: "2024-11-05",
-          serverInfo: { name: "make-mcp-server", version: "1.0.0" },
+          serverInfo: { name: "make-mcp-server", version: "1.0.1" },
           capabilities: { tools: {} },
         };
         break;
+      case "notifications/initialized":
+        // Client acknowledgment - no response needed
+        return null;
       case "tools/list":
         result = { tools };
         break;
@@ -244,33 +227,104 @@ app.post("/mcp", async (req, res) => {
         const toolResult = await executeTool(params.name, params.arguments || {});
         result = { content: [{ type: "text", text: JSON.stringify(toolResult, null, 2) }] };
         break;
+      case "ping":
+        result = {};
+        break;
       default:
         throw new Error(`Unknown method: ${method}`);
     }
     
-    res.json({ jsonrpc: "2.0", id, result });
+    if (id !== undefined) {
+      return { jsonrpc: "2.0", id, result };
+    }
+    return null;
   } catch (error) {
-    res.json({
-      jsonrpc: "2.0",
-      id,
-      error: { code: -32603, message: error instanceof Error ? error.message : String(error) },
-    });
+    if (id !== undefined) {
+      return {
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32603, message: error instanceof Error ? error.message : String(error) },
+      };
+    }
+    return null;
+  }
+}
+
+// SSE endpoint - establishes connection and returns session ID
+app.get("/sse", (req: Request, res: Response) => {
+  const sessionId = randomUUID();
+  
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  
+  // Store session
+  sessions.set(sessionId, res);
+  
+  // Send endpoint event with session ID
+  res.write(`event: endpoint\ndata: /messages?sessionId=${sessionId}\n\n`);
+  
+  // Keepalive
+  const keepAlive = setInterval(() => {
+    res.write(": keepalive\n\n");
+  }, 30000);
+  
+  req.on("close", () => {
+    clearInterval(keepAlive);
+    sessions.delete(sessionId);
+  });
+});
+
+// Messages endpoint - receives MCP requests and sends responses via SSE
+app.post("/messages", async (req: Request, res: Response) => {
+  const sessionId = req.query.sessionId as string;
+  
+  if (!sessionId || !sessions.has(sessionId)) {
+    res.status(400).json({ error: "Invalid or missing sessionId" });
+    return;
+  }
+  
+  const sseResponse = sessions.get(sessionId)!;
+  
+  // Read raw body
+  let body = "";
+  req.setEncoding("utf8");
+  
+  for await (const chunk of req) {
+    body += chunk;
+  }
+  
+  try {
+    const request = JSON.parse(body);
+    const response = await handleMcpRequest(request);
+    
+    if (response) {
+      sseResponse.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
+    }
+    
+    res.status(202).json({ status: "accepted" });
+  } catch (error) {
+    console.error("Error handling message:", error);
+    res.status(400).json({ error: "Invalid request" });
   }
 });
 
 // Health check
-app.get("/health", (req, res) => res.json({ status: "ok", service: "make-mcp-server" }));
+app.get("/health", (req: Request, res: Response) => {
+  res.json({ status: "ok", sessions: sessions.size, version: "1.0.1" });
+});
 
 // Root endpoint
-app.get("/", (req, res) => {
+app.get("/", (req: Request, res: Response) => {
   res.json({
     name: "Make.com MCP Server",
-    version: "1.0.0",
-    endpoints: { sse: "/sse", mcp: "/mcp", health: "/health" },
+    version: "1.0.1",
+    endpoints: { sse: "/sse", messages: "/messages", health: "/health" },
     tools: tools.map(t => t.name),
   });
 });
 
 app.listen(PORT, () => {
-  console.log(`Make.com MCP Server running on port ${PORT}`);
+  console.log(`Make.com MCP Server v1.0.1 running on port ${PORT}`);
 });
